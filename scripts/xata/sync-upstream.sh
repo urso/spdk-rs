@@ -311,6 +311,9 @@ map_branch() {
 fetch_upstream() {
   local upstream_branch="$1"
 
+  log "Fetching tags from $DETECTED_UPSTREAM_REMOTE..."
+  git fetch "$DETECTED_UPSTREAM_REMOTE" 'refs/tags/*:refs/tags/*' 2>/dev/null || true
+
   log "Fetching from $DETECTED_UPSTREAM_REMOTE/$upstream_branch..."
 
   # Always fetch (even in dry-run) - it's read-only and needed for preview
@@ -330,10 +333,48 @@ check_upstream_branch() {
   fi
 }
 
+# Determine the merge target based on branch type and available tags
+# For release branches: sync to latest stable release, or latest tag if no stable exists
+# For other branches: sync to HEAD
+determine_merge_target() {
+  local upstream_branch="$1"
+
+  if [[ "$upstream_branch" =~ ^release/([0-9]+\.[0-9]+) ]]; then
+    local version="${BASH_REMATCH[1]}"
+
+    # Find latest stable tag (no alpha/rc/beta suffix)
+    local latest_stable=$(git tag -l --merged "$DETECTED_UPSTREAM_REMOTE/$upstream_branch" \
+      --sort=-version:refname "v${version}.*" | grep -v -E -- '-(alpha|rc|beta)' | head -1)
+
+    if [ -n "$latest_stable" ]; then
+      # Stable release exists - use it (ignore any newer RC/alpha tags)
+      log "Release branch detected - syncing to latest stable release: $latest_stable" >&2
+      echo "$latest_stable"
+      return
+    fi
+
+    # No stable release - find latest tag including RC/alpha
+    local latest_tag=$(git tag -l --merged "$DETECTED_UPSTREAM_REMOTE/$upstream_branch" \
+      --sort=-version:refname "v${version}.*" | head -1)
+
+    if [ -n "$latest_tag" ]; then
+      log "No stable release found - syncing to latest pre-release tag: $latest_tag" >&2
+      echo "$latest_tag"
+      return
+    fi
+
+    # No tags at all - sync to HEAD (new release in development)
+    log "No tags found on $upstream_branch - syncing to HEAD (new release)" >&2
+  fi
+
+  # develop or other branches - sync to HEAD
+  echo "$DETECTED_UPSTREAM_REMOTE/$upstream_branch"
+}
+
 # Check for divergence
 check_divergence() {
   local upstream_branch="$1"
-  local merge_target="$DETECTED_UPSTREAM_REMOTE/$upstream_branch"
+  local merge_target="$2"
 
   local ahead behind
   ahead=$(git rev-list --count HEAD.."$merge_target" 2>/dev/null || echo "0")
@@ -358,8 +399,7 @@ check_divergence() {
 
 # Attempt merge
 merge_upstream() {
-  local upstream_branch="$1"
-  local merge_target="$DETECTED_UPSTREAM_REMOTE/$upstream_branch"
+  local merge_target="$1"
 
   log "Attempting to merge $merge_target..."
 
@@ -588,13 +628,20 @@ main() {
   # Check if upstream branch exists
   check_upstream_branch "$upstream_branch"
 
+  # Determine merge target (tag or branch HEAD)
+  local merge_target
+  merge_target=$(determine_merge_target "$upstream_branch")
+  log "Merge target: $merge_target"
+
+  echo ""
+
   # Check for divergence
-  check_divergence "$upstream_branch"
+  check_divergence "$upstream_branch" "$merge_target"
 
   echo ""
 
   # Attempt merge
-  if merge_upstream "$upstream_branch"; then
+  if merge_upstream "$merge_target"; then
     echo ""
     success "Sync completed successfully!"
     exit 0
